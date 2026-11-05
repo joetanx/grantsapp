@@ -1,0 +1,9 @@
+{
+  "version": "fictional-rubric-1.0",
+  "policy_version": "fictional-policy-1.0",
+  "rules": [
+    {"id": "residency", "section": "P1", "instruction": "Compare the supplied residency answer to yes."},
+    {"id": "income", "section": "P2", "instruction": "Compare supplied monthly household income with the 2000 fictional credit threshold."}
+  ],
+  "instructions": "Distinguish applicant-supplied facts from missing or uncertain information and rule findings. Do not infer facts. Name and context fields are not automatic disqualifiers. The recommendation is non-binding and staff may disagree."
+}
