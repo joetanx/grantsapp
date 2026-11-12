@@ -1,7 +1,55 @@
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1
+
+# --- Stage 1: build ---
+FROM python:slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /build
+
+# Install build dependencies for compiling Python packages
+RUN apt update && apt install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+
+# Create a clean virtual environment
+RUN python -m venv /opt/venv
+# Update PATH so subsequent pip commands automatically use the virtual environment
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install Python packages inside the virtual environment
+COPY pyproject.toml .
+RUN pip install --no-cache-dir .
+
+# --- Stage 2: runtime ---
+FROM python:slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # Permanently append the copied virtual environment to the runtime PATH
+    PATH="/opt/venv/bin:$PATH"
+
+# Create a non-root system user for security
+RUN groupadd --system app && useradd --system --gid app --home /app app
+
 WORKDIR /app
-COPY pyproject.toml ./
-RUN python -c 'import subprocess, sys, tomllib; deps = tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]; subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", *deps])'
-ENV PORT=8080 APP_DIR=/mnt/grants PYTHONUNBUFFERED=1
+
+# 1. Copy the virtual environment from the builder stage
+# 2. Automatically change ownership to the non-root user
+COPY --from=builder --chown=app:app /opt/venv /opt/venv
+
+# Copy application code (keep commented if mounting from volume)
+# COPY --chown=app:app . .
+
+# Switch away from root to the non-root application user
+USER app
+
 EXPOSE 8080
-CMD ["python", "/mnt/grants/app.py"]
+
+# Healthcheck using Python's built-in urllib to avoid installing curl/wget
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; from os import environ; urllib.request.urlopen('http://localhost:8080/health', timeout=5)"
+
+# App aiohttp binds 0.0.0.0:8080
+CMD ["python", "app.py"]

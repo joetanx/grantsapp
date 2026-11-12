@@ -36,3 +36,4 @@ A minimum viable product (MVP) and proof-of-concept pilot application for demons
     - for simplicity, any sign in with valid entra login will be created as valid user of the respective portal
 - LangGraph agent that can be interfaced through Web UI, or separate flows based on trigger (or certain api) to perform tasks
 - application use managed identity for all required non-human access: Foundry model, container image pull from ACR, and all database operations from Web UI actions and agent workflows
+

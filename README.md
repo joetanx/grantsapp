@@ -1,9 +1,34 @@
-# Fictional grants demonstration
+# Grants app: demonstration only
 
-For controlled pilot accounts and fictional data only. Any authenticated user can self-provision staff access; this is **unsafe for real cases**. Staff, never the model, make final decisions. This is not a production welfare service.
+This uses **synthetic data only** and a fictional policy. Any user authenticated in the configured tenant can enter the staff portal, see all applications, and make decisions. There is no staff-role check. Restrict the tenant, audience and network to trusted demo participants; this is not suitable for real citizen data or a production service.
 
-The dependency image runs `/mnt/grants/app.py`; mount `app.py`, `index.html`, `admin.html`, `policy.json`, `rubric.json`, and `instructions.txt` read-only there. Set `PORT` (default 8080), `APP_DIR` (default directory containing app.py), `POLICY_PATH`, `RUBRIC_PATH`, `INSTRUCTIONS_PATH` (optional overrides), `POSTGRES_HOST`, `POSTGRES_DATABASE`, `POSTGRES_USER`, `FOUNDRY_PROJECT_ENDPOINT`, `FOUNDRY_MODEL_DEPLOYMENT`, and optionally `AZURE_CLIENT_ID`. The project endpoint has the form `https://<resource>.services.ai.azure.com/api/projects/<project>`; the model deployment must support Chat Completions and tool calling. `AZURE_CLIENT_ID` selects a user-assigned managed identity; omit it for the system-assigned identity. The same managed identity is used for PostgreSQL and Foundry, with no local credential fallback. PostgreSQL TLS uses the system trust store; set `POSTGRES_SSLROOTCERT` if a specific CA bundle is needed. The configured database principal needs permission to create and use the schema. No database or Foundry credentials are stored in the files.
+## Configuration
 
-Container Apps must enforce Entra authentication, HTTPS, and trusted platform identity headers; the container must not be reachable around that authentication middleware. Enable external HTTPS ingress to port 8080, use one replica, and configure the intended Entra audience and callback. Give the app managed identity access to PostgreSQL and Foundry and the pull identity the appropriate ACR permissions. Configure PostgreSQL Entra authentication, networking and DNS. Mount a supported classic NFS Azure Files share through an environment storage definition (`NfsAzureFile`) with private endpoint, DNS and VNet routing; restrict share writes to operators. NFS mount authentication is network-based, not managed identity. Container Apps' NFS limitation requires encryption in transit to be disabled for the share, which must be accounted for in the network design. Authentication client secrets, if needed, belong in Container Apps secrets, not the share.
+Provision the infrastructure and permissions separately. Set these environment variables on the container app:
 
-Changes to mounted app/content files require a revision restart; dependency changes require a new image. Policy and rubric are intentionally fictional. When policy, rubric, instructions, database or inference configuration is unavailable, the application reports an error instead of inventing policy or finalizing a case.
+| Variable | Purpose |
+|---|---|
+| `TENANT_ID` | Allowed Microsoft Entra tenant ID, in UUID format. |
+| `APP_ORIGIN` | Exact public HTTPS origin; used to check CSRF request origins.<br>(e.g. `https://demo.example.com`, without a trailing slash)|
+| `PGHOST` | PostgreSQL server hostname. |
+| `PGPORT` | PostgreSQL server port, defaults to `5432` |
+| `PGDATABASE` | PostgreSQL database name. |
+| `PGUSER` | PostgreSQL role for the managed identity. |
+| `FOUNDRY_ENDPOINT` | Azure AI Foundry project endpoint. |
+| `FOUNDRY_MODEL` | Deployed model name; the model must support structured output. |
+| `UAMI_CLIENT_ID` | User-assigned managed identity client ID. |
+
+The app obtains PostgreSQL and Foundry credentials using `ManagedIdentityCredential`, not passwords or API keys
+- The managed identity must be:
+    - Created as database principal and grant it database connect, schema creation and table permissions.
+    - Granted the `Cognitive Services User` inference role for Foundry endpoint and `AcrPull` role for container image pull from ACR.
+- PostgreSQL TLS uses certificate and host verification; add step in Dockerfile to install the server CA in the image trust store if required.
+
+## Azure setup
+
+1. Create a Container Apps environment integrated into a custom VNet. Configure Azure Files NFS, its private endpoint and private DNS; allow TCP 2049 from the environment. Register environment storage and mount it as `NfsAzureFile` at `/app`. Container Apps NFS does not support encryption in transit: configure the storage account accordingly, restrict the network, and protect the share from unauthorized writes. NFS mount access is a network/storage exception to token-based application service access.
+2. Populate the share with `app.py`, `citizen.html`, `admin.html`, `policy.md`, `rubric.md` and the three `*_instructions.md` files. Protect these files: they include executable code and model instructions. Build and push the Docker image to ACR, attach the managed identity, configure its pull access, and run one replica with HTTPS ingress to port 8080. The Dockerfile's CMD runs the mounted app; its `/app` copy is not an automatic fallback.
+3. Enable Container Apps built-in authentication with Microsoft Entra, require authentication for all routes, and configure the allowed tenant, audience and redirect URLs. Guests work only if configured in the tenant and registration. Ensure requests cannot bypass the platform authentication layer: the application trusts the platform-injected `X-MS-CLIENT-PRINCIPAL` header, so direct access or user-controlled spoofed headers would defeat authentication. Configure the platform session cookies as secure and HTTP-only. The app also checks tenant, origin and a CSRF token for writes.
+4. Configure the environment variables above, verified-TLS network access to PostgreSQL and the Foundry project endpoint, and the managed identity roles. Restart the revision after changing mounted code, policy, rubric or instructions. The app creates its demo tables at startup; failures are reported rather than switching backends.
+
+See the [Container Apps storage mounts](https://learn.microsoft.com/en-us/azure/container-apps/storage-mounts), [PostgreSQL managed identity](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/security-connect-with-managed-identity) and [Foundry managed identity](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/managed-identity) documentation for current platform setup details.
