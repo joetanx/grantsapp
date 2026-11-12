@@ -5,14 +5,17 @@ This diagram shows the **deployment described by the repository**, not a verifie
 ```mermaid
 flowchart TD
     Users["Citizen and staff browsers"]
-    Entra["Entra ID tenant and app registration"]
-    UAMI["User-assigned managed identity"]
     ACR["Azure Container Registry"]
     Foundry["Foundry model deployment"]
     Files@{ shape: docs, label: "Azure Files NFS share" }
     UAMI -.->|"AcrPull role"| ACR
     UAMI -.->|"Cognitive Services User role"| Foundry
 
+    subgraph Entra["Entra ID tenant"]
+        AppReg["App registration"]
+        UAMI["User-assigned managed identity"]
+        AgentId["Agent Identity"]
+    end
     subgraph VNet["Virtual network"]
         subgraph CAE["Azure Container Apps Environment"]
             Auth["HTTPS ingress + built-in authentication"]
@@ -21,9 +24,19 @@ flowchart TD
             Auth -->|"authenticated requests principal header"| aiohttp
             subgraph ACA["Azure Container App"]
                 aiohttp["aiohttp web application"]
-                aiohttp -->|agent invocation| Agent[LangGraph]
-                Agent -->|agent tools database access| psycopg
+                aiohttp -->|agent invocation| Agent[LangGraph agent]
                 aiohttp -->|webapp database access| psycopg
+                Agent -->|agent tools database access| psycopg
+                subgraph Credentials
+                    UAMIToken["UAMI Token"]
+                    AgentIdToken["Agent Identity Token"]
+                end
+                Otel(Microsoft OpenTelemetry SDK)
+                Agent -->|BaggageBuilder| Otel
+                psycopg ~~~ Credentials
+                AgentIdToken -.-> psycopg
+                AgentIdToken -.-> Otel
+                UAMIToken -.-> Agent
             end
         end
 
@@ -41,12 +54,14 @@ flowchart TD
     end
 
     Users -->|"HTTPS"| Auth
-    Auth <-->|"sign-in and session"| Entra
-    DNS ~~~ UAMI
-    UAMI -.-> |"database principal and privileges"| PG
+    Auth <-->|"sign-in and session"| AppReg
+    AgentId -.-> |"database principal and privileges"| PG
     ACR -.->|"container image pull"| ACA
     Agent -.->|"model inference"| Foundry
+    UAMI -.-> UAMIToken
+    AgentId -.-> AgentIdToken
     PE --> Files
+    Otel -->|telemetry export| a365(Agent 365 Observability Service)
 ```
 
 ### 1.2. Connections and responsibilities
@@ -61,7 +76,34 @@ flowchart TD
 
 The repository requires network reachability to PostgreSQL and Foundry, but **does not establish whether those services use private endpoints or public endpoints**. Only the Azure Files private endpoint is explicitly described.
 
-### 1.3. Operational and security boundaries
+### 1.3. Identity and access management
+
+#### 1.3.1. Azure Container Apps Entra ID Authorization
+
+Azure Container Apps provides built-in authentication and authorization features (sometimes referred to as "Easy Auth"), to secure external ingress-enabled container app with minimal or no code. (https://learn.microsoft.com/en-us/azure/container-apps/authentication)
+
+Setup: https://learn.microsoft.com/en-us/azure/container-apps/authentication-entra
+
+#### 1.3.2. [planned] change to Entra agent identity for postgres access
+
+### 1.4. [planned] security services to turn on
+
+Likely no/minimal change required for architecture and code, some maybe already part of the services planned or just turn on:
+- Code security
+    - Source code control commit to GitHub for GHAS: CodeQL, Dependabot, secrets scanning
+    - Connect GitHub repo to MDASH for agentics scans
+- Defender for Cloud
+    - Defender CSPM
+    - Defender for SQL
+    - Defender for DevOps (connect GitHub)
+    - Defender for Containers
+- Agent 365
+    - Agent identity and governance
+    - Agent registry
+    - Observability with Microsoft OpenTelemetry
+    - Security for AI - Defender real-time threat protection
+
+### 1.5. Operational and security boundaries
 
 - **Demo access only:** Any authenticated user in the configured tenant can enter the staff portal, see all applications and make decisions; there is no staff-role check. Use synthetic data and restrict participants. `README.md:1–3`
 - **Authentication trust:** The app trusts the platform-provided principal header. Deployment must prevent requests from bypassing platform authentication or supplying a spoofed header. `README.md:31`
