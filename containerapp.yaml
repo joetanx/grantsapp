@@ -1,0 +1,107 @@
+location: ${LOCATION}
+resourceGroup: ${RG}
+name: ${APP_NAME}
+identity:
+  type: UserAssigned
+  userAssignedIdentities:
+    ${UAMI_RSC_ID}: {}
+properties:
+  managedEnvironmentId: ${CAE_ID}
+  configuration:
+    registries:
+      - server: ${ACR_NAME}.azurecr.io
+        identity: ${UAMI_RSC_ID}
+    ingress:
+      external: true
+      allowInsecure: false
+      targetPort: 8080
+      transport: auto
+  template:
+    volumes:
+      - name: ${APP_NAME}-vol
+        storageType: NfsAzureFile
+        storageName: ${APP_NAME}
+    containers:
+      - name: ${APP_NAME}
+        image: ${ACR_NAME}.azurecr.io/${APP_NAME}:latest
+        volumeMounts:
+          - volumeName: ${APP_NAME}-vol
+            mountPath: /app
+        resources:
+          cpu: 0.5
+          memory: 1Gi
+        env:
+          # Listener for aiohttp.web run_app
+          - name: HOST
+            value: "0.0.0.0"
+          - name: PORT
+            value: "8080"
+          - name: LOG_LEVEL
+            value: "INFO"
+
+          # LangChain / Azure AI Foundry model connection
+          - name: FOUNDRY_PROJECT_ENDPOINT
+            value: "${FOUNDRY_PROJECT_ENDPOINT}"
+          - name: FOUNDRY_MODEL
+            value: "${FOUNDRY_MODEL}"
+          - name: UAMI_CLIENT_ID
+            value: "${UAMI_CLIENT_ID}"
+
+          # Agent blueprint connection settings (M365 Agents SDK / Entra Agent User)
+          - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHORITY
+            value: "https://login.microsoftonline.com/${TENANT_ID}"
+          - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHTYPE
+            value: FederatedCredentials
+          - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID
+            value: "${BLUEPRINT_CLIENT_ID}"
+          - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__FEDERATEDCLIENTID
+            value: "${UAMI_CLIENT_ID}"
+          - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID
+            value: "${TENANT_ID}"
+
+          # Agent identity and user IDs
+          - name: AGENTIC_INSTANCE_ID
+            value: "${AGENTIC_INSTANCE_ID}"
+          - name: AGENTIC_USER_ID
+            value: "${AGENTIC_USER_ID}"
+
+          # Azure PostgreSQL (Entra Agent User auth via get_agent_user_token)
+          - name: PGHOST
+            value: "${PGHOST}"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "${PGDATABASE}"
+          - name: PGUSER
+            value: "${PGUSER}"
+          - name: PGSSLMODE
+            value: "require"
+
+          # Azure Monitor / Microsoft Sentinel (Log Analytics + DCR/DCE)
+          - name: LOG_ANALYTICS_WORKSPACE_ID
+            value: "${LOG_ANALYTICS_WORKSPACE_ID}"
+          - name: DCE_ENDPOINT
+            value: "${DCE_ENDPOINT}"
+          - name: DCR_IMMUTABLE_ID
+            value: "${DCR_IMMUTABLE_ID}"
+          - name: DCR_STREAM_NAME
+            value: "Custom-ScamIntel_CL"
+
+          # External search & reputation APIs
+          - name: KEENABLE_API_KEY
+            value: "${KEENABLE_API_KEY}"
+          - name: TAVILY_API_KEY
+            value: "${TAVILY_API_KEY}"
+          - name: MXTOOLBOX_API_KEY
+            value: "${MXTOOLBOX_API_KEY}"
+          - name: DNS_NAMESERVER
+            value: "${DNS_NAMESERVER}"
+
+          # Telegram intake webhook
+          - name: TELEGRAM_BOT_TOKEN
+            value: "${TELEGRAM_BOT_TOKEN}"
+          - name: TELEGRAM_WEBHOOK_SECRET
+            value: "${TELEGRAM_WEBHOOK_SECRET}"
+    scale:
+      minReplicas: 1
+      maxReplicas: 1

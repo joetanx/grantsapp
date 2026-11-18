@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ScamIntel — Staff Triage Console</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous" />
+</head>
+<body class="bg-body-tertiary">
+  <nav class="navbar navbar-expand-lg border-bottom bg-body">
+    <div class="container-fluid px-4">
+      <a class="navbar-brand fw-semibold" href="/">ScamIntel Staff Console</a>
+      <div class="d-flex align-items-center gap-3">
+        <span id="user-label" class="small text-body-secondary">Loading user...</span>
+        <a href="/citizen" class="btn btn-outline-secondary btn-sm">Citizen View</a>
+        <a href="/.auth/logout?post_logout_redirect_uri=/?logged_out=1" class="btn btn-outline-danger btn-sm">Logout</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container-fluid px-4 py-4">
+    <div id="alert-box" class="alert d-none" role="alert"></div>
+
+    <div class="row g-4">
+      <div class="col-lg-5">
+        <div class="card shadow-sm">
+          <div class="card-header d-flex justify-content-between align-items-center gap-2">
+            <span class="fw-semibold">Incoming Reports</span>
+            <div class="d-flex gap-2">
+              <select id="status-filter" class="form-select form-select-sm" style="width: auto;">
+                <option value="">All statuses</option>
+                <option value="investigating">investigating</option>
+                <option value="triaged">triaged</option>
+                <option value="committed">committed</option>
+              </select>
+              <button id="refresh-btn" class="btn btn-outline-secondary btn-sm">Refresh</button>
+            </div>
+          </div>
+          <div class="list-group list-group-flush" id="reports-list" style="max-height: 75vh; overflow-y: auto;">
+            <div class="p-4 text-center text-body-secondary">Loading reports...</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col-lg-7">
+        <div id="detail-panel" class="card shadow-sm">
+          <div class="card-body text-center text-body-secondary py-5">
+            Select a report from the list to inspect entities, agent rationale, and commit to Sentinel.
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    let selectedReportId = null;
+
+    function esc(str) {
+      return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function showAlert(msg, kind = "danger") {
+      const box = document.getElementById("alert-box");
+      box.className = `alert alert-${kind}`;
+      box.textContent = msg;
+      box.classList.remove("d-none");
+    }
+
+    function verdictBadge(v) {
+      if (v === "suspected_scam") return '<span class="badge text-bg-danger">suspected_scam</span>';
+      if (v === "likely_benign") return '<span class="badge text-bg-success">likely_benign</span>';
+      if (v === "inconclusive") return '<span class="badge text-bg-warning">inconclusive</span>';
+      return '<span class="badge text-bg-secondary">pending</span>';
+    }
+
+    function pubBadge(status) {
+      if (status === "published") return '<span class="badge text-bg-success">published (ingestion accepted)</span>';
+      if (status === "failed") return '<span class="badge text-bg-danger">failed</span>';
+      return '<span class="badge text-bg-warning">pending</span>';
+    }
+
+    async function apiFetch(url, opts = {}) {
+      const headers = { ...(opts.headers || {}), "X-Requested-With": "XMLHttpRequest" };
+      if (opts.body && !headers["Content-Type"]) {
+        headers["Content-Type"] = "application/json";
+      }
+      const resp = await fetch(url, { ...opts, headers });
+      if (resp.status === 401) {
+        window.location.href = "/.auth/login/aad?post_login_redirect_uri=" + encodeURIComponent(window.location.pathname);
+        throw new Error("Authentication required");
+      }
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      return data;
+    }
+
+    async function loadMe() {
+      try {
+        const me = await apiFetch("/api/me");
+        document.getElementById("user-label").textContent = me.display_name || me.email || "Staff User";
+      } catch (err) {
+        showAlert(err.message);
+      }
+    }
+
+    async function loadReports() {
+      const listEl = document.getElementById("reports-list");
+      const status = document.getElementById("status-filter").value;
+      try {
+        const url = status ? `/api/staff/reports?status=${encodeURIComponent(status)}` : "/api/staff/reports";
+        const data = await apiFetch(url);
+        const rows = data.reports || [];
+        if (!rows.length) {
+          listEl.innerHTML = '<div class="p-4 text-center text-body-secondary">No reports found.</div>';
+          return;
+        }
+        listEl.innerHTML = rows.map(r => `
+          <button type="button"
+                  class="list-group-item list-group-item-action ${r.id === selectedReportId ? 'active' : ''}"
+                  onclick="selectReport('${esc(r.id)}')">
+            <div class="d-flex justify-content-between align-items-center mb-1">
+              <span class="badge text-bg-secondary">${esc(r.channel)}</span>
+              <span class="small">${esc(new Date(r.received_at).toLocaleString())}</span>
+            </div>
+            <div class="fw-semibold text-truncate">${esc(r.subject || "(No subject)")}</div>
+            <div class="d-flex justify-content-between align-items-center mt-1 small">
+              <span>Status: <strong>${esc(r.processing_status)}</strong></span>
+              ${verdictBadge(r.assessment)}
+            </div>
+          </button>
+        `).join("");
+      } catch (err) {
+        listEl.innerHTML = `<div class="p-4 text-danger">${esc(err.message)}</div>`;
+      }
+    }
+
+    async function selectReport(id) {
+      selectedReportId = id;
+      await loadReports();
+      const panel = document.getElementById("detail-panel");
+      panel.innerHTML = '<div class="card-body text-center py-5 text-body-secondary">Loading detail...</div>';
+      try {
+        const data = await apiFetch(`/api/staff/reports/${encodeURIComponent(id)}`);
+        renderDetail(data);
+      } catch (err) {
+        panel.innerHTML = `<div class="card-body text-danger">${esc(err.message)}</div>`;
+      }
+    }
+
+    function renderDetail(data) {
+      const r = data.report;
+      const entities = data.entities || [];
+      const assessments = data.assessments || [];
+      const outbox = data.outbox || [];
+      const latest = assessments[0] || {};
+      const panel = document.getElementById("detail-panel");
+
+      panel.innerHTML = `
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <div>
+            <span class="badge text-bg-secondary me-2">${esc(r.channel)}</span>
+            <strong>${esc(r.subject || "(No subject)")}</strong>
+          </div>
+          ${verdictBadge(r.assessment)}
+        </div>
+        <div class="card-body">
+          <div class="mb-3">
+            <div class="small text-body-secondary mb-1">Report ID: <code>${esc(r.id)}</code> | Status: <strong>${esc(r.processing_status)}</strong></div>
+            <pre class="p-3 rounded border bg-body-tertiary mb-0" style="white-space: pre-wrap;">${esc(r.body_text)}</pre>
+          </div>
+
+          <h3 class="h6 mt-4">Extracted Entities &amp; Evidence</h3>
+          <div class="table-responsive mb-4">
+            <table class="table table-sm align-middle">
+              <thead>
+                <tr>
+                  <th>Type</th>
+                  <th>Value</th>
+                  <th>Match</th>
+                  <th>Confidence</th>
+                  <th>Evidence Ref</th>
+                  <th>Publish to ScamIntel_CL</th>
+                </tr>
+              </thead>
+              <tbody id="entities-edit-body">
+                ${entities.length ? entities.map(e => `
+                  <tr data-entity-id="${esc(e.id)}">
+                    <td><code>${esc(e.type)}</code></td>
+                    <td class="text-break">${esc(e.value)}</td>
+                    <td>
+                      <select class="form-select form-select-sm ent-matches">
+                        ${["none", "scamintel", "microsoft_ti", "public_web"].map(opt =>
+                          `<option value="${opt}" ${e.matches === opt ? "selected" : ""}>${opt}</option>`
+                        ).join("")}
+                      </select>
+                    </td>
+                    <td>
+                      <select class="form-select form-select-sm ent-confidence">
+                        ${["low", "medium", "high"].map(opt =>
+                          `<option value="${opt}" ${e.confidence === opt ? "selected" : ""}>${opt}</option>`
+                        ).join("")}
+                      </select>
+                    </td>
+                    <td><input type="text" class="form-control form-control-sm ent-evidence" value="${esc(e.evidence_ref || "")}" /></td>
+                    <td class="text-center">
+                      <input type="checkbox" class="form-check-input ent-flag" ${e.flag_for_scamintel ? "checked" : ""} />
+                    </td>
+                  </tr>
+                `).join("") : '<tr><td colspan="6" class="text-body-secondary text-center">No entities extracted.</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+
+          <h3 class="h6">Staff Review &amp; Commit</h3>
+          <form id="commit-form" class="border rounded p-3 mb-4 bg-body-tertiary">
+            <div class="row g-3 mb-3">
+              <div class="col-md-4">
+                <label class="form-label small">Verdict</label>
+                <select id="commit-verdict" class="form-select form-select-sm">
+                  ${["suspected_scam", "likely_benign", "inconclusive"].map(v =>
+                    `<option value="${v}" ${(latest.verdict || r.assessment) === v ? "selected" : ""}>${v}</option>`
+                  ).join("")}
+                </select>
+              </div>
+              <div class="col-md-8">
+                <label class="form-label small">Rationale</label>
+                <textarea id="commit-rationale" class="form-control form-control-sm" rows="3" required>${esc(latest.rationale || "")}</textarea>
+              </div>
+            </div>
+            <button type="submit" class="btn btn-primary btn-sm">Approve / Commit Assessment &amp; Publish Flagged Indicators</button>
+          </form>
+
+          <h3 class="h6">Sentinel ScamIntel_CL Publication Outbox</h3>
+          <p class="small text-body-secondary mb-2">
+            Note: An accepted ingestion write may take a few minutes to become searchable in Log Analytics.
+          </p>
+          <div class="table-responsive mb-4">
+            <table class="table table-sm align-middle">
+              <thead>
+                <tr>
+                  <th>Indicator</th>
+                  <th>Status</th>
+                  <th>Attempts</th>
+                  <th>Error</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${outbox.length ? outbox.map(o => `
+                  <tr>
+                    <td class="small"><code>${esc(o.payload?.Type)}</code> ${esc(o.payload?.Value)}</td>
+                    <td>${pubBadge(o.status)}</td>
+                    <td>${esc(o.attempts)}</td>
+                    <td class="small text-danger">${esc(o.last_error || "")}</td>
+                    <td>
+                      ${o.status !== "published" ? `<button type="button" class="btn btn-outline-warning btn-sm" onclick="retryOutbox('${esc(o.id)}')">Retry</button>` : ""}
+                    </td>
+                  </tr>
+                `).join("") : '<tr><td colspan="5" class="text-body-secondary text-center">No outbox publications yet.</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+
+          <h3 class="h6">Assessment History</h3>
+          <ul class="list-group list-group-flush small">
+            ${assessments.map(a => `
+              <li class="list-group-item px-0">
+                <div class="d-flex justify-content-between">
+                  <span><strong>v${esc(a.version)}</strong> (${esc(a.actor_type)}) — ${verdictBadge(a.verdict)}</span>
+                  <span class="text-body-secondary">${esc(new Date(a.created_at).toLocaleString())}</span>
+                </div>
+                <div class="mt-1 text-body-secondary" style="white-space: pre-wrap;">${esc(a.rationale)}</div>
+              </li>
+            `).join("")}
+          </ul>
+        </div>
+      `;
+
+      document.getElementById("commit-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const entityRows = Array.from(document.querySelectorAll("#entities-edit-body tr[data-entity-id]"));
+        const entityUpdates = entityRows.map(tr => ({
+          id: tr.getAttribute("data-entity-id"),
+          matches: tr.querySelector(".ent-matches").value,
+          confidence: tr.querySelector(".ent-confidence").value,
+          evidence_ref: tr.querySelector(".ent-evidence").value || null,
+          flag_for_scamintel: tr.querySelector(".ent-flag").checked,
+        }));
+        try {
+          const res = await apiFetch(`/api/staff/reports/${encodeURIComponent(r.id)}/commit`, {
+            method: "POST",
+            body: JSON.stringify({
+              verdict: document.getElementById("commit-verdict").value,
+              rationale: document.getElementById("commit-rationale").value,
+              entities: entityUpdates,
+            }),
+          });
+          showAlert("Assessment committed and flagged indicators processed.", "success");
+          renderDetail(res.detail);
+          await loadReports();
+        } catch (err) {
+          showAlert(err.message);
+        }
+      });
+    }
+
+    async function retryOutbox(outboxId) {
+      try {
+        await apiFetch(`/api/staff/outbox/${encodeURIComponent(outboxId)}/retry`, { method: "POST" });
+        showAlert("Outbox retry completed.", "info");
+        if (selectedReportId) {
+          await selectReport(selectedReportId);
+        }
+      } catch (err) {
+        showAlert(err.message);
+      }
+    }
+
+    document.getElementById("refresh-btn").addEventListener("click", loadReports);
+    document.getElementById("status-filter").addEventListener("change", loadReports);
+
+    loadMe();
+    loadReports();
+  </script>
+</body>
+</html>

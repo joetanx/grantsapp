@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ScamIntel — Citizen Portal</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous" />
+</head>
+<body class="bg-body-tertiary">
+  <nav class="navbar navbar-expand-lg border-bottom bg-body">
+    <div class="container">
+      <a class="navbar-brand fw-semibold" href="/">ScamIntel</a>
+      <div class="d-flex align-items-center gap-3">
+        <span id="user-label" class="small text-body-secondary">Loading user...</span>
+        <a href="/staff" class="btn btn-outline-secondary btn-sm">Staff View</a>
+        <a href="/.auth/logout?post_logout_redirect_uri=/?logged_out=1" class="btn btn-outline-danger btn-sm">Logout</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container py-4" style="max-width: 960px;">
+    <div id="alert-box" class="alert d-none" role="alert"></div>
+
+    <div class="card shadow-sm mb-4">
+      <div class="card-header fw-semibold">Submit Suspected Scam Report</div>
+      <div class="card-body">
+        <form id="report-form">
+          <div class="mb-3">
+            <label for="subject" class="form-label">Subject / Summary (optional)</label>
+            <input type="text" class="form-control" id="subject" placeholder="e.g. Suspicious bank SMS asking to verify account" />
+          </div>
+          <div class="mb-3">
+            <label for="body_text" class="form-label">Message Content, URLs, Phone Numbers, or Email Details</label>
+            <textarea class="form-control" id="body_text" rows="5" required placeholder="Paste the suspicious message, URL, sender email, or phone number here..."></textarea>
+          </div>
+          <button type="submit" id="submit-btn" class="btn btn-primary">Submit Report</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="card shadow-sm">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span class="fw-semibold">My Submitted Reports</span>
+        <button id="refresh-btn" class="btn btn-outline-secondary btn-sm">Refresh</button>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+          <thead>
+            <tr>
+              <th>Received</th>
+              <th>Subject</th>
+              <th>Status</th>
+              <th>Assessment</th>
+              <th>Entities</th>
+            </tr>
+          </thead>
+          <tbody id="reports-tbody">
+            <tr><td colspan="5" class="text-center text-body-secondary py-4">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    function esc(str) {
+      return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function showAlert(msg, kind = "danger") {
+      const box = document.getElementById("alert-box");
+      box.className = `alert alert-${kind}`;
+      box.textContent = msg;
+      box.classList.remove("d-none");
+    }
+
+    function badgeForVerdict(verdict) {
+      if (verdict === "suspected_scam") return '<span class="badge text-bg-danger">suspected_scam</span>';
+      if (verdict === "likely_benign") return '<span class="badge text-bg-success">likely_benign</span>';
+      if (verdict === "inconclusive") return '<span class="badge text-bg-warning">inconclusive</span>';
+      return '<span class="badge text-bg-secondary">pending</span>';
+    }
+
+    async function apiFetch(url, opts = {}) {
+      const headers = { ...(opts.headers || {}), "X-Requested-With": "XMLHttpRequest" };
+      if (opts.body && !headers["Content-Type"]) {
+        headers["Content-Type"] = "application/json";
+      }
+      const resp = await fetch(url, { ...opts, headers });
+      if (resp.status === 401) {
+        window.location.href = "/.auth/login/aad?post_login_redirect_uri=" + encodeURIComponent(window.location.pathname);
+        throw new Error("Authentication required");
+      }
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      return data;
+    }
+
+    async function loadMe() {
+      try {
+        const me = await apiFetch("/api/me");
+        document.getElementById("user-label").textContent = me.display_name || me.email || "Authenticated User";
+      } catch (err) {
+        showAlert(err.message);
+      }
+    }
+
+    async function loadReports() {
+      const tbody = document.getElementById("reports-tbody");
+      try {
+        const data = await apiFetch("/api/reports");
+        const rows = data.reports || [];
+        if (!rows.length) {
+          tbody.innerHTML = '<tr><td colspan="5" class="text-center text-body-secondary py-4">No reports submitted yet.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = rows.map(r => `
+          <tr>
+            <td class="small text-body-secondary">${esc(new Date(r.received_at).toLocaleString())}</td>
+            <td>${esc(r.subject || "(No subject)")}</td>
+            <td><span class="badge text-bg-info">${esc(r.processing_status)}</span></td>
+            <td>${badgeForVerdict(r.assessment)}</td>
+            <td>${esc(r.entity_count ?? 0)}</td>
+          </tr>
+        `).join("");
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="5" class="text-center text-danger py-4">${esc(err.message)}</td></tr>`;
+      }
+    }
+
+    document.getElementById("report-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById("submit-btn");
+      btn.disabled = true;
+      try {
+        await apiFetch("/api/reports", {
+          method: "POST",
+          body: JSON.stringify({
+            subject: document.getElementById("subject").value,
+            body_text: document.getElementById("body_text").value,
+          }),
+        });
+        document.getElementById("report-form").reset();
+        showAlert("Report submitted! Automated triage is running.", "success");
+        await loadReports();
+      } catch (err) {
+        showAlert(err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    document.getElementById("refresh-btn").addEventListener("click", loadReports);
+
+    loadMe();
+    loadReports();
+    setInterval(loadReports, 10000);
+  </script>
+</body>
+</html>
