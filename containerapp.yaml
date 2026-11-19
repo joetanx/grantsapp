@@ -87,15 +87,11 @@ properties:
           - name: DCR_STREAM_NAME
             value: "Custom-ScamIntel_CL"
 
-          # External search & reputation APIs
+          # External search APIs
           - name: KEENABLE_API_KEY
             value: "${KEENABLE_API_KEY}"
           - name: TAVILY_API_KEY
             value: "${TAVILY_API_KEY}"
-          - name: MXTOOLBOX_API_KEY
-            value: "${MXTOOLBOX_API_KEY}"
-          - name: DNS_NAMESERVER
-            value: "${DNS_NAMESERVER}"
 
           # Telegram intake webhook
           - name: TELEGRAM_BOT_TOKEN

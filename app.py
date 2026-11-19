@@ -143,84 +143,6 @@ class AzureAccessTokenProvider:
 # ---------------------------------------------------------------------------
 # PostgreSQL Interface (psycopg v3, parameterised queries)
 # ---------------------------------------------------------------------------
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    object_id TEXT NOT NULL,
-    display_name TEXT,
-    email TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_login_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (tenant_id, object_id)
-);
-
-CREATE TABLE IF NOT EXISTS reports (
-    id UUID PRIMARY KEY,
-    reporter_user_id UUID NULL REFERENCES users(id),
-    channel TEXT NOT NULL CHECK (channel IN ('web', 'email', 'telegram')),
-    channel_message_id TEXT NOT NULL,
-    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    subject TEXT,
-    body_text TEXT NOT NULL,
-    processing_status TEXT NOT NULL DEFAULT 'pending',
-    assessment TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS report_entities (
-    id UUID PRIMARY KEY,
-    report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
-    type TEXT NOT NULL,
-    value TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    matches TEXT NOT NULL DEFAULT 'none' CHECK (matches IN ('scamintel', 'microsoft_ti', 'public_web', 'none')),
-    evidence_ref TEXT,
-    confidence TEXT NOT NULL DEFAULT 'medium',
-    flag_for_scamintel BOOLEAN NOT NULL DEFAULT FALSE
-);
-
-CREATE TABLE IF NOT EXISTS assessments (
-    id UUID PRIMARY KEY,
-    report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
-    version INTEGER NOT NULL,
-    verdict TEXT NOT NULL CHECK (verdict IN ('suspected_scam', 'likely_benign', 'inconclusive')),
-    rationale TEXT NOT NULL,
-    actor_type TEXT NOT NULL CHECK (actor_type IN ('agent', 'staff')),
-    actor_user_id UUID NULL REFERENCES users(id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (report_id, version)
-);
-
-CREATE TABLE IF NOT EXISTS indicator_registry (
-    id UUID PRIMARY KEY,
-    entity_type TEXT NOT NULL,
-    entity_value TEXT NOT NULL,
-    first_observed_at TIMESTAMPTZ NOT NULL,
-    last_observed_at TIMESTAMPTZ NOT NULL,
-    latest_version INTEGER NOT NULL DEFAULT 1,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (entity_type, entity_value)
-);
-
-CREATE TABLE IF NOT EXISTS publication_outbox (
-    id UUID PRIMARY KEY,
-    report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
-    report_entity_id UUID NOT NULL REFERENCES report_entities(id) ON DELETE CASCADE,
-    indicator_id UUID NULL REFERENCES indicator_registry(id),
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'published', 'failed')),
-    attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT,
-    payload JSONB NOT NULL,
-    published_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-"""
-
-
 async def get_db_conn() -> psycopg.AsyncConnection[dict[str, Any]]:
     """Open an async PostgreSQL connection using Entra Agent User token or PGPASSWORD."""
     host = environ.get("PGHOST", "")
@@ -242,13 +164,6 @@ async def get_db_conn() -> psycopg.AsyncConnection[dict[str, Any]]:
         sslmode=sslmode,
         row_factory=dict_row,
     )
-
-
-async def ensure_schema() -> None:
-    """Create PostgreSQL tables if they do not exist."""
-    async with await get_db_conn() as conn:
-        await conn.execute(SCHEMA_SQL)
-        await conn.commit()
 
 
 async def db_upsert_user(
@@ -568,8 +483,8 @@ async def db_commit_staff_review(
                 payload = {
                     "TimeGenerated": now_utc.isoformat(),
                     "ReportEntityId": str(ent["id"]),
-                    "Type": ent["type"],
-                    "Value": ent["value"],
+                    "EntityType": ent["type"],
+                    "EntityValue": ent["value"],
                     "EvidenceRef": ent.get("evidence_ref") or "",
                     "Confidence": ent.get("confidence") or "medium",
                     "FirstObservedAt": ind["first_observed_at"].isoformat(),
@@ -647,12 +562,12 @@ async def search_scamintel(indicators: list[str]) -> dict[str, dict[str, Any]]:
         return {}
     kql = (
         "ScamIntel_CL\n"
-        f"| where Value in~ ({_kql_string_list(indicators)})\n"
-        "| project TimeGenerated, ReportEntityId, Type, Value, EvidenceRef, Confidence, FirstObservedAt, LastObservedAt\n"
-        "| summarize arg_max(TimeGenerated, *) by Value"
+        f"| where EntityValue in~ ({_kql_string_list(indicators)})\n"
+        "| project TimeGenerated, ReportEntityId, EntityType, EntityValue, EvidenceRef, Confidence, FirstObservedAt, LastObservedAt\n"
+        "| summarize arg_max(TimeGenerated, *) by EntityValue"
     )
     rows = await query_log_analytics(kql, timespan_days=90)
-    return {str(r["Value"]).lower(): r for r in rows if r.get("Value")}
+    return {str(r["EntityValue"]).lower(): r for r in rows if r.get("EntityValue")}
 
 
 async def ingest_scamintel_records(records: list[dict[str, Any]]) -> None:
@@ -723,14 +638,11 @@ async def publish_outbox_item(outbox_id: uuid.UUID) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Enrichment Lookups (DNS & MxToolbox)
+# Enrichment Lookups (DNS & DNSBL)
 # ---------------------------------------------------------------------------
 async def lookup_dns_records(domain: str) -> dict[str, Any]:
     def _resolve() -> dict[str, Any]:
         resolver = dns.resolver.Resolver()
-        ns = environ.get("DNS_NAMESERVER", "").strip()
-        if ns:
-            resolver.nameservers = [ns]
         resolver.lifetime = 5.0
         result: dict[str, Any] = {"domain": domain, "records": {}}
         for rtype in ("A", "AAAA", "MX", "TXT"):
@@ -744,30 +656,78 @@ async def lookup_dns_records(domain: str) -> dict[str, Any]:
     return await asyncio.to_thread(_resolve)
 
 
-async def lookup_mxtoolbox(domain: str) -> dict[str, Any]:
-    api_key = environ.get("MXTOOLBOX_API_KEY", "").strip()
-    if not api_key:
-        return {"domain": domain, "status": "skipped", "reason": "MXTOOLBOX_API_KEY not configured"}
+DOMAIN_DNSBL_ZONES = ("dbl.spamhaus.org", "multi.surbl.org")
+IP_DNSBL_ZONES = ("zen.spamhaus.org", "bl.spamcop.net")
 
-    def _fetch() -> dict[str, Any]:
-        resp = requests.get(
-            f"https://api.mxtoolbox.com/api/v1/Lookup/mx/{domain}",
-            headers={"Authorization": api_key},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+
+def _query_dnsbl(resolver: dns.resolver.Resolver, qname: str, zone: str) -> dict[str, Any]:
+    try:
+        answers = resolver.resolve(qname, "A")
+        codes = [str(rdata).strip() for rdata in answers]
+    except dns.resolver.NXDOMAIN:
+        return {"zone": zone, "status": "clean", "codes": []}
+    except Exception as exc:
+        return {"zone": zone, "status": "error", "error": str(exc), "codes": []}
+
+    # Filter out public/shared resolver block & rate-limit return codes
+    if any(c.startswith("127.255.255.") for c in codes) or (zone == "multi.surbl.org" and codes == ["127.0.0.1"]):
+        return {"zone": zone, "status": "rate_limited", "codes": codes}
+
+    return {"zone": zone, "status": "listed", "codes": codes}
+
+
+async def lookup_domain_dnsbl(domain: str) -> dict[str, Any]:
+    """Check an email/web domain and its MX (or fallback A) IPv4 addresses against public DNSBLs."""
+    cleaned_domain = domain.strip().lower().rstrip(".")
+
+    def _check() -> dict[str, Any]:
+        resolver = dns.resolver.Resolver()
+        resolver.lifetime = 5.0
+
+        mx_hosts: list[str] = []
+        try:
+            mx_answers = resolver.resolve(cleaned_domain, "MX")
+            mx_hosts = [str(r.exchange).strip().rstrip(".").lower() for r in mx_answers]
+        except Exception:
+            mx_hosts = []
+
+        checked_ips: list[str] = []
+        hosts_to_resolve = mx_hosts if mx_hosts else [cleaned_domain]
+        for host in hosts_to_resolve[:5]:
+            try:
+                a_answers = resolver.resolve(host, "A")
+                for r in a_answers:
+                    ip = str(r).strip()
+                    if ip not in checked_ips:
+                        checked_ips.append(ip)
+            except Exception:
+                continue
+
+        domain_results = [
+            _query_dnsbl(resolver, f"{cleaned_domain}.{zone}", zone)
+            for zone in DOMAIN_DNSBL_ZONES
+        ]
+
+        ip_results: list[dict[str, Any]] = []
+        for ip in checked_ips[:5]:
+            rev_ip = ".".join(reversed(ip.split(".")))
+            for zone in IP_DNSBL_ZONES:
+                res = _query_dnsbl(resolver, f"{rev_ip}.{zone}", zone)
+                res["ip"] = ip
+                ip_results.append(res)
+
+        all_results = domain_results + ip_results
         return {
-            "domain": domain,
-            "failed": data.get("Failed", []),
-            "warnings": data.get("Warnings", []),
-            "passed": len(data.get("Passed", [])),
+            "domain": cleaned_domain,
+            "mx_hosts": mx_hosts,
+            "checked_ips": checked_ips,
+            "domain_dnsbl": domain_results,
+            "ip_dnsbl": ip_results,
+            "listed_count": sum(1 for r in all_results if r["status"] == "listed"),
+            "rate_limited_count": sum(1 for r in all_results if r["status"] == "rate_limited"),
         }
 
-    try:
-        return await asyncio.to_thread(_fetch)
-    except Exception as exc:
-        return {"domain": domain, "status": "error", "error": str(exc)}
+    return await asyncio.to_thread(_check)
 
 
 # ---------------------------------------------------------------------------
@@ -868,11 +828,11 @@ async def dns_lookup_tool(
 
 
 @tool
-async def mxtoolbox_lookup_tool(
-    domain: Annotated[str, Field(description="Email or sender domain to check reputation via MxToolbox")]
+async def domain_dnsbl_lookup_tool(
+    domain: Annotated[str, Field(description="Email or sender domain to check against domain and MX IP DNSBL blocklists")]
 ) -> str:
-    """Check domain MX reputation using MxToolbox API."""
-    return json.dumps(await lookup_mxtoolbox(domain))
+    """Check domain and its MX mail-server IPs against public DNSBLs (Spamhaus DBL/ZEN, SURBL, SpamCop)."""
+    return json.dumps(await lookup_domain_dnsbl(domain))
 
 
 @tool
@@ -928,7 +888,7 @@ async def get_mcp_search_tools() -> list[BaseTool]:
 AGENT_SYSTEM_PROMPT = """You are a ScamIntel triage analyst investigating citizen-submitted suspected scam reports.
 Deterministic Threat Intelligence (ThreatIntelIndicators) and ScamIntel_CL lookups have already been run.
 Your job:
-1. For any unmatched entities (matches == 'none'), use the web search tools (Keenable/Tavily), DNS lookup, and MxToolbox lookup to check for scam reports, phishing, or malicious reputation.
+1. For any unmatched entities (matches == 'none'), use the web search tools (Keenable/Tavily), DNS lookup, and DNSBL domain/MX blacklist lookup to check for scam reports, phishing, or malicious reputation.
 2. If web search finds suspicious/malicious evidence for an entity, set matches='public_web', provide the source URL in evidence_ref, set confidence, and set flag_for_scamintel=True.
 3. For entities already matched in 'scamintel', keep flag_for_scamintel=True so a fresh observation snapshot can be recorded.
 4. Provide an overall verdict:
@@ -1009,7 +969,7 @@ async def investigate_report(report_id: uuid.UUID, subject: Optional[str], body_
                 tools: list[BaseTool] = [
                     current_utc_time,
                     dns_lookup_tool,
-                    mxtoolbox_lookup_tool,
+                    domain_dnsbl_lookup_tool,
                     search_scamintel_tool,
                     search_microsoft_ti_tool,
                     *mcp_tools,
@@ -1461,20 +1421,9 @@ async def messages_entry_point(request: Request) -> Response:
 # ---------------------------------------------------------------------------
 # Application Factory & Startup
 # ---------------------------------------------------------------------------
-async def on_startup(app: Application) -> None:
-    app["bg_tasks"] = set()
-    if environ.get("PGHOST"):
-        try:
-            await ensure_schema()
-            logger.info("PostgreSQL schema verified.")
-        except Exception as exc:
-            logger.warning("Startup schema check failed (will retry on demand): %s", exc)
-
-
 def create_app() -> Application:
     app = Application(middlewares=[auth_and_csrf_middleware])
     app["bg_tasks"] = set()
-    app.on_startup.append(on_startup)
 
     # Static / HTML pages (read from mounted /app per request)
     app.router.add_get("/", handle_index)

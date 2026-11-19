@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "dataCollectionRuleName": { "type": "string" },
+    "location": { "type": "string", "defaultValue": "[resourceGroup().location]" },
+    "workspaceResourceId": { "type": "string" },
+    "endpointResourceId": { "type": "string" }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Insights/dataCollectionRules",
+      "apiVersion": "2022-06-01",
+      "name": "[parameters('dataCollectionRuleName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "dataCollectionEndpointId": "[parameters('endpointResourceId')]",
+        "streamDeclarations": {
+          "Custom-ScamIntel_CL": {
+            "columns": [
+              { "name": "TimeGenerated", "type": "datetime" },
+              { "name": "ReportEntityId", "type": "string" },
+              { "name": "Type", "type": "string" },
+              { "name": "Value", "type": "string" },
+              { "name": "EvidenceRef", "type": "string" },
+              { "name": "Confidence", "type": "string" },
+              { "name": "FirstObservedAt", "type": "datetime" },
+              { "name": "LastObservedAt", "type": "datetime" }
+            ]
+          }
+        },
+        "destinations": {
+          "logAnalytics": [
+            {
+              "workspaceResourceId": "[parameters('workspaceResourceId')]",
+              "name": "scamintel-la"
+            }
+          ]
+        },
+        "dataFlows": [
+          {
+            "streams": ["Custom-ScamIntel_CL"],
+            "destinations": ["scamintel-la"],
+            "transformKql": "source",
+            "outputStream": "Custom-ScamIntel_CL"
+          }
+        ]
+      }
+    }
+  ]
+}

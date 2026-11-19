@@ -20,7 +20,7 @@ All application code and static HTML pages are mounted from an Azure Files NFS s
 
 1. **Intake**: Citizens submit reports via Web (`POST /api/reports`), Email (`POST /api/messages` via M365 Agents SDK / A365 Notifications), or Telegram (`POST /api/telegram/webhook`).
 2. **Deterministic Extraction & Lookups**: `investigate_report` extracts URLs, emails, domains, IPv4 addresses, and phone numbers (`extract_entities`), resolves domain IPs via `dnspython`, and queries Microsoft Sentinel `ThreatIntelIndicators` and `ScamIntel_CL` via `azure-monitor-query`.
-3. **Agent Investigation**: Unmatched entities are investigated by a LangChain agent (`create_agent` with `ToolStrategy(TriageResult)`) using Azure AI Foundry, Keenable/Tavily remote MCP search tools, DNS lookup, and MxToolbox reputation lookup. If any check or the agent fails, the verdict degrades safely to `inconclusive` (never `likely_benign`).
+3. **Agent Investigation**: Unmatched entities are investigated by a LangChain agent (`create_agent` with `ToolStrategy(TriageResult)`) using Azure AI Foundry, Keenable/Tavily remote MCP search tools, DNS lookup, and `dnspython` domain/MX DNSBL lookups (Spamhaus DBL/ZEN, SURBL, SpamCop, filtering out `127.255.255.*` resolver-block codes). If any check or the agent fails, the verdict degrades safely to `inconclusive` (never `likely_benign`).
 4. **Staff Review & Commit**: Staff review triaged reports in `/staff`, optionally edit entity matches/flags or verdict/rationale, and commit (`POST /api/staff/reports/{id}/commit`). Flagged indicators (`public_web` malice or repeated `scamintel` matches) are recorded in `indicator_registry` and `publication_outbox`, then uploaded to `ScamIntel_CL` via `azure-monitor-ingestion`.
 
 ## API Endpoints
@@ -45,7 +45,7 @@ Non-GET `/api/*` endpoints (except webhooks) require a custom `X-Requested-With`
 
 ## Data Model & Deviations from `intent.md`
 
-`app.py` auto-creates the PostgreSQL schema on startup (`ensure_schema`):
+PostgreSQL tables must be created beforehand (see **Prerequisites** below):
 - `users`, `reports`, `report_entities`, `assessments` (as specified in `intent.md`)
 - **Added columns on `report_entities`**: `confidence` (`low` | `medium` | `high`) and `flag_for_scamintel` (`boolean`) so agent and staff decisions about `ScamIntel_CL` publication are persisted cleanly.
 - **Added column on `assessments`**: `actor_user_id` (`UUID`, nullable) to link staff reviews to `users.id`.
@@ -60,9 +60,224 @@ Non-GET `/api/*` endpoints (except webhooks) require a custom `X-Requested-With`
 | `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__*`, `AGENTIC_INSTANCE_ID`, `AGENTIC_USER_ID` | M365 Agents SDK / Entra Agent User federated credentials |
 | `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGSSLMODE` | Azure PostgreSQL connection (uses Entra token; `PGPASSWORD` optional for local dev) |
 | `LOG_ANALYTICS_WORKSPACE_ID`, `DCE_ENDPOINT`, `DCR_IMMUTABLE_ID`, `DCR_STREAM_NAME` | Sentinel Log Analytics query & `ScamIntel_CL` Logs Ingestion |
-| `KEENABLE_API_KEY`, `TAVILY_API_KEY`, `MXTOOLBOX_API_KEY`, `DNS_NAMESERVER` | Search MCP servers, MxToolbox API, and optional custom DNS resolver |
+| `KEENABLE_API_KEY`, `TAVILY_API_KEY` | Keenable and Tavily remote MCP search API keys |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` | Telegram bot reply & webhook secret validation |
 | `ALLOW_DEV_AUTH` | Set `"true"` only for local non-Easy-Auth testing |
+
+## Prerequisites
+
+### 1. PostgreSQL Database & Tables
+
+Acquire an Entra access token for Azure Database for PostgreSQL, connect via `psql`, and create the required tables:
+
+```bash
+export PGPASSWORD=$(az account get-access-token \
+  --resource https://ossrdbms-aad.database.windows.net \
+  --query accessToken \
+  --output tsv)
+
+psql -h <postgres-fqdn> -p 5432 -U <user-name> -d <dbname>
+```
+
+Run the following SQL:
+
+```sql
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    object_id TEXT NOT NULL,
+    display_name TEXT,
+    email TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, object_id)
+);
+
+CREATE TABLE IF NOT EXISTS reports (
+    id UUID PRIMARY KEY,
+    reporter_user_id UUID NULL REFERENCES users(id),
+    channel TEXT NOT NULL CHECK (channel IN ('web', 'email', 'telegram')),
+    channel_message_id TEXT NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    subject TEXT,
+    body_text TEXT NOT NULL,
+    processing_status TEXT NOT NULL DEFAULT 'pending',
+    assessment TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS report_entities (
+    id UUID PRIMARY KEY,
+    report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    matches TEXT NOT NULL DEFAULT 'none' CHECK (matches IN ('scamintel', 'microsoft_ti', 'public_web', 'none')),
+    evidence_ref TEXT,
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    flag_for_scamintel BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS assessments (
+    id UUID PRIMARY KEY,
+    report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('suspected_scam', 'likely_benign', 'inconclusive')),
+    rationale TEXT NOT NULL,
+    actor_type TEXT NOT NULL CHECK (actor_type IN ('agent', 'staff')),
+    actor_user_id UUID NULL REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (report_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS indicator_registry (
+    id UUID PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    entity_value TEXT NOT NULL,
+    first_observed_at TIMESTAMPTZ NOT NULL,
+    last_observed_at TIMESTAMPTZ NOT NULL,
+    latest_version INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (entity_type, entity_value)
+);
+
+CREATE TABLE IF NOT EXISTS publication_outbox (
+    id UUID PRIMARY KEY,
+    report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+    report_entity_id UUID NOT NULL REFERENCES report_entities(id) ON DELETE CASCADE,
+    indicator_id UUID NULL REFERENCES indicator_registry(id),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'published', 'failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    payload JSONB NOT NULL,
+    published_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### 2. Microsoft Sentinel (`ScamIntel_CL` Table, DCE, and DCR)
+
+1. **Create the custom Log Analytics table `ScamIntel_CL`**:
+
+```bash
+az monitor log-analytics workspace table create \
+  --resource-group "<ResourceGroupName>" \
+  --workspace-name "<WorkspaceName>" \
+  --name "ScamIntel_CL" \
+  --plan Analytics \
+  --retention-time 30 \
+  --total-retention-time 90 \
+  --columns \
+    TimeGenerated=datetime \
+    ReportEntityId=string \
+    EntityType=string \
+    EntityValue=string \
+    EvidenceRef=string \
+    Confidence=string \
+    FirstObservedAt=datetime \
+    LastObservedAt=datetime
+```
+
+2. **Create the Data Collection Endpoint (DCE)** and note its resource ID and `logsIngestion.endpoint` (`DCE_ENDPOINT`):
+
+```bash
+az monitor data-collection endpoint create \
+  --resource-group "<ResourceGroupName>" \
+  --location "<Location>" \
+  --name "scamintel-dce" \
+  --public-network-access Enabled
+
+DCE_ID=$(az monitor data-collection endpoint show \
+  --resource-group "<ResourceGroupName>" \
+  --name "scamintel-dce" \
+  --query id -o tsv)
+
+az monitor data-collection endpoint show \
+  --resource-group "<ResourceGroupName>" \
+  --name "scamintel-dce" \
+  --query logsIngestion.endpoint -o tsv
+```
+
+3. **Create the DCR ARM template `scamintel-dcr.json`** (matching `Custom-ScamIntel_CL` and linking to the DCE and Log Analytics workspace):
+
+```json
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "dataCollectionRuleName": { "type": "string" },
+    "location": { "type": "string", "defaultValue": "[resourceGroup().location]" },
+    "workspaceResourceId": { "type": "string" },
+    "endpointResourceId": { "type": "string" }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Insights/dataCollectionRules",
+      "apiVersion": "2022-06-01",
+      "name": "[parameters('dataCollectionRuleName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "dataCollectionEndpointId": "[parameters('endpointResourceId')]",
+        "streamDeclarations": {
+          "Custom-ScamIntel_CL": {
+            "columns": [
+              { "name": "TimeGenerated", "type": "datetime" },
+              { "name": "ReportEntityId", "type": "string" },
+              { "name": "EntityType", "type": "string" },
+              { "name": "EntityValue", "type": "string" },
+              { "name": "EvidenceRef", "type": "string" },
+              { "name": "Confidence", "type": "string" },
+              { "name": "FirstObservedAt", "type": "datetime" },
+              { "name": "LastObservedAt", "type": "datetime" }
+            ]
+          }
+        },
+        "destinations": {
+          "logAnalytics": [
+            {
+              "workspaceResourceId": "[parameters('workspaceResourceId')]",
+              "name": "scamintel-la"
+            }
+          ]
+        },
+        "dataFlows": [
+          {
+            "streams": ["Custom-ScamIntel_CL"],
+            "destinations": ["scamintel-la"],
+            "transformKql": "source",
+            "outputStream": "Custom-ScamIntel_CL"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+4. **Deploy the DCR and retrieve `immutableId` (`DCR_IMMUTABLE_ID`)**:
+
+```bash
+WORKSPACE_ID=$(az monitor log-analytics workspace show \
+  --resource-group "<ResourceGroupName>" \
+  --workspace-name "<WorkspaceName>" \
+  --query id -o tsv)
+
+az deployment group create \
+  --resource-group "<ResourceGroupName>" \
+  --template-file scamintel-dcr.json \
+  --parameters \
+    dataCollectionRuleName="scamintel-dcr" \
+    workspaceResourceId="$WORKSPACE_ID" \
+    endpointResourceId="$DCE_ID"
+
+az monitor data-collection rule show \
+  --resource-group "<ResourceGroupName>" \
+  --name "scamintel-dcr" \
+  --query immutableId -o tsv
+```
 
 ## Deployment Steps
 

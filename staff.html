@@ -255,7 +255,7 @@
               <tbody>
                 ${outbox.length ? outbox.map(o => `
                   <tr>
-                    <td class="small"><code>${esc(o.payload?.Type)}</code> ${esc(o.payload?.Value)}</td>
+                    <td class="small"><code>${esc(o.payload?.EntityType)}</code> ${esc(o.payload?.EntityValue)}</td>
                     <td>${pubBadge(o.status)}</td>
                     <td>${esc(o.attempts)}</td>
                     <td class="small text-danger">${esc(o.last_error || "")}</td>
