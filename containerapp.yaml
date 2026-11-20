@@ -8,6 +8,15 @@ identity:
 properties:
   managedEnvironmentId: ${CAE_ID}
   configuration:
+    secrets:
+      - name: keenable-api-key
+        value: "${KEENABLE_API_KEY}"
+      - name: tavily-api-key
+        value: "${TAVILY_API_KEY}"
+      - name: telegram-bot-token
+        value: "${TELEGRAM_BOT_TOKEN}"
+      - name: telegram-webhook-secret
+        value: "${TELEGRAM_WEBHOOK_SECRET}"
     registries:
       - server: ${ACR_NAME}.azurecr.io
         identity: ${UAMI_RSC_ID}
@@ -30,6 +39,34 @@ properties:
         resources:
           cpu: 0.5
           memory: 1Gi
+        probes:
+          - type: Startup
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          - type: Readiness
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          - type: Liveness
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
         env:
           # Listener for aiohttp.web run_app
           - name: HOST
@@ -89,15 +126,15 @@ properties:
 
           # External search APIs
           - name: KEENABLE_API_KEY
-            value: "${KEENABLE_API_KEY}"
+            secretRef: keenable-api-key
           - name: TAVILY_API_KEY
-            value: "${TAVILY_API_KEY}"
+            secretRef: tavily-api-key
 
           # Telegram intake webhook
           - name: TELEGRAM_BOT_TOKEN
-            value: "${TELEGRAM_BOT_TOKEN}"
+            secretRef: telegram-bot-token
           - name: TELEGRAM_WEBHOOK_SECRET
-            value: "${TELEGRAM_WEBHOOK_SECRET}"
+            secretRef: telegram-webhook-secret
     scale:
       minReplicas: 1
       maxReplicas: 1

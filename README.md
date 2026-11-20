@@ -11,7 +11,7 @@ All application code and static HTML pages are mounted from an Azure Files NFS s
 ├── app.py          # aiohttp server, PostgreSQL/Sentinel helpers, LangChain agent, webhooks
 ├── index.html      # Public splash page with Entra Easy Auth login & logout banner
 ├── citizen.html    # Citizen AJAX portal (submit report, track status)
-└── staff.html      # Staff AJAX triage console (review, edit, commit, Sentinel outbox)
+└── staff.html      # Staff AJAX triage console (review, edit, commit, inline Sentinel publication)
 ```
 
 `pyproject.toml` and `containerapp.yaml` live in the deployment repo (with `Dockerfile` baking the Python virtual environment from `pyproject.toml` while `/app` is volume-mounted at runtime).
@@ -21,7 +21,7 @@ All application code and static HTML pages are mounted from an Azure Files NFS s
 1. **Intake**: Citizens submit reports via Web (`POST /api/reports`), Email (`POST /api/messages` via M365 Agents SDK / A365 Notifications), or Telegram (`POST /api/telegram/webhook`).
 2. **Deterministic Extraction & Lookups**: `investigate_report` extracts URLs, emails, domains, IPv4 addresses, and phone numbers (`extract_entities`), resolves domain IPs via `dnspython`, and queries Microsoft Sentinel `ThreatIntelIndicators` and `ScamIntel_CL` via `azure-monitor-query`.
 3. **Agent Investigation**: Unmatched entities are investigated by a LangChain agent (`create_agent` with `ToolStrategy(TriageResult)`) using Azure AI Foundry, Keenable/Tavily remote MCP search tools, DNS lookup, and `dnspython` domain/MX DNSBL lookups (Spamhaus DBL/ZEN, SURBL, SpamCop, filtering out `127.255.255.*` resolver-block codes). If any check or the agent fails, the verdict degrades safely to `inconclusive` (never `likely_benign`).
-4. **Staff Review & Commit**: Staff review triaged reports in `/staff`, optionally edit entity matches/flags or verdict/rationale, and commit (`POST /api/staff/reports/{id}/commit`). Flagged indicators (`public_web` malice or repeated `scamintel` matches) are recorded in `indicator_registry` and `publication_outbox`, then uploaded to `ScamIntel_CL` via `azure-monitor-ingestion`.
+4. **Staff Review & Commit**: Staff review triaged reports in `/staff`, optionally edit entity matches/flags or verdict/rationale, and commit (`POST /api/staff/reports/{id}/commit`). Flagged entities (`public_web` malice or repeated `scamintel` matches) are published to `ScamIntel_CL` via `azure-monitor-ingestion`.
 
 ## API Endpoints
 
@@ -33,11 +33,10 @@ All application code and static HTML pages are mounted from an Azure Files NFS s
 | `GET /api/me` | Easy Auth | Upserts and returns current `users` record |
 | `GET /api/reports` | Easy Auth | List reports submitted by current user |
 | `POST /api/reports` | Easy Auth + CSRF | Submit a new web report (`subject`, `body_text`) |
-| `GET /api/reports/{id}` | Easy Auth | Get report detail, entities, assessments, and outbox status |
+| `GET /api/reports/{id}` | Easy Auth | Get report detail, entities, and assessments |
 | `GET /api/staff/reports` | Easy Auth | List all reports (optional `?status=`) |
 | `GET /api/staff/reports/{id}` | Easy Auth | Get full report detail for staff review |
-| `POST /api/staff/reports/{id}/commit` | Easy Auth + CSRF | Append staff assessment, update report, publish flagged indicators |
-| `POST /api/staff/outbox/{id}/retry` | Easy Auth + CSRF | Retry failed `ScamIntel_CL` ingestion for an outbox row |
+| `POST /api/staff/reports/{id}/commit` | Easy Auth + CSRF | Append staff assessment, update report, publish flagged indicators to Sentinel |
 | `POST /api/telegram/webhook` | `X-Telegram-Bot-Api-Secret-Token` | Telegram Bot message intake |
 | `POST /api/messages` | M365 Agents JWT | Agent 365 email notification & Bot Framework intake |
 
@@ -46,10 +45,10 @@ Non-GET `/api/*` endpoints (except webhooks) require a custom `X-Requested-With`
 ## Data Model & Deviations from `intent.md`
 
 PostgreSQL tables must be created beforehand (see **Prerequisites** below):
-- `users`, `reports`, `report_entities`, `assessments` (as specified in `intent.md`)
-- **Added columns on `report_entities`**: `confidence` (`low` | `medium` | `high`) and `flag_for_scamintel` (`boolean`) so agent and staff decisions about `ScamIntel_CL` publication are persisted cleanly.
+- `users`, `reports`, `assessments` (as specified in `intent.md`)
+- An append-only `entities` table (keyed by `id`, linked to `reports(id)`, indexed on `(type, value)`), with `confidence` (`low` | `medium` | `high`) and `flag_for_scamintel` (`boolean`). `FirstObservedAt` / `LastObservedAt` for `ScamIntel_CL` are computed via `MIN(reports.received_at)` / `MAX(reports.received_at)` across all rows matching `(type, value)`.
 - **Added column on `assessments`**: `actor_user_id` (`UUID`, nullable) to link staff reviews to `users.id`.
-- **Bookkeeping tables**: `indicator_registry` (tracks `first_observed_at`, `last_observed_at`, `latest_version`) and `publication_outbox` (tracks `pending` / `published` / `failed`, `attempts`, `last_error`, `payload`) so the Staff UI accurately reflects ingestion status rather than assuming immediate Log Analytics searchability.
+- Flagged entities are published inline to `ScamIntel_CL` during `POST /api/staff/reports/{id}/commit`; any ingestion failure is logged with the failed payload without blocking the commit.
 
 ## Environment Variables
 
@@ -107,7 +106,7 @@ CREATE TABLE IF NOT EXISTS reports (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS report_entities (
+CREATE TABLE IF NOT EXISTS entities (
     id UUID PRIMARY KEY,
     report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
     type TEXT NOT NULL,
@@ -115,9 +114,11 @@ CREATE TABLE IF NOT EXISTS report_entities (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     matches TEXT NOT NULL DEFAULT 'none' CHECK (matches IN ('scamintel', 'microsoft_ti', 'public_web', 'none')),
     evidence_ref TEXT,
-    confidence TEXT NOT NULL DEFAULT 'medium',
+    confidence TEXT NOT NULL DEFAULT 'medium' CHECK (confidence IN ('low', 'medium', 'high')),
     flag_for_scamintel BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+CREATE INDEX IF NOT EXISTS idx_entities_type_value ON entities (type, value);
 
 CREATE TABLE IF NOT EXISTS assessments (
     id UUID PRIMARY KEY,
@@ -129,32 +130,6 @@ CREATE TABLE IF NOT EXISTS assessments (
     actor_user_id UUID NULL REFERENCES users(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (report_id, version)
-);
-
-CREATE TABLE IF NOT EXISTS indicator_registry (
-    id UUID PRIMARY KEY,
-    entity_type TEXT NOT NULL,
-    entity_value TEXT NOT NULL,
-    first_observed_at TIMESTAMPTZ NOT NULL,
-    last_observed_at TIMESTAMPTZ NOT NULL,
-    latest_version INTEGER NOT NULL DEFAULT 1,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (entity_type, entity_value)
-);
-
-CREATE TABLE IF NOT EXISTS publication_outbox (
-    id UUID PRIMARY KEY,
-    report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
-    report_entity_id UUID NOT NULL REFERENCES report_entities(id) ON DELETE CASCADE,
-    indicator_id UUID NULL REFERENCES indicator_registry(id),
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'published', 'failed')),
-    attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT,
-    payload JSONB NOT NULL,
-    published_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 

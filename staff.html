@@ -78,12 +78,6 @@
       return '<span class="badge text-bg-secondary">pending</span>';
     }
 
-    function pubBadge(status) {
-      if (status === "published") return '<span class="badge text-bg-success">published (ingestion accepted)</span>';
-      if (status === "failed") return '<span class="badge text-bg-danger">failed</span>';
-      return '<span class="badge text-bg-warning">pending</span>';
-    }
-
     async function apiFetch(url, opts = {}) {
       const headers = { ...(opts.headers || {}), "X-Requested-With": "XMLHttpRequest" };
       if (opts.body && !headers["Content-Type"]) {
@@ -158,7 +152,6 @@
       const r = data.report;
       const entities = data.entities || [];
       const assessments = data.assessments || [];
-      const outbox = data.outbox || [];
       const latest = assessments[0] || {};
       const panel = document.getElementById("detail-panel");
 
@@ -237,37 +230,6 @@
             <button type="submit" class="btn btn-primary btn-sm">Approve / Commit Assessment &amp; Publish Flagged Indicators</button>
           </form>
 
-          <h3 class="h6">Sentinel ScamIntel_CL Publication Outbox</h3>
-          <p class="small text-body-secondary mb-2">
-            Note: An accepted ingestion write may take a few minutes to become searchable in Log Analytics.
-          </p>
-          <div class="table-responsive mb-4">
-            <table class="table table-sm align-middle">
-              <thead>
-                <tr>
-                  <th>Indicator</th>
-                  <th>Status</th>
-                  <th>Attempts</th>
-                  <th>Error</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${outbox.length ? outbox.map(o => `
-                  <tr>
-                    <td class="small"><code>${esc(o.payload?.EntityType)}</code> ${esc(o.payload?.EntityValue)}</td>
-                    <td>${pubBadge(o.status)}</td>
-                    <td>${esc(o.attempts)}</td>
-                    <td class="small text-danger">${esc(o.last_error || "")}</td>
-                    <td>
-                      ${o.status !== "published" ? `<button type="button" class="btn btn-outline-warning btn-sm" onclick="retryOutbox('${esc(o.id)}')">Retry</button>` : ""}
-                    </td>
-                  </tr>
-                `).join("") : '<tr><td colspan="5" class="text-body-secondary text-center">No outbox publications yet.</td></tr>'}
-              </tbody>
-            </table>
-          </div>
-
           <h3 class="h6">Assessment History</h3>
           <ul class="list-group list-group-flush small">
             ${assessments.map(a => `
@@ -302,7 +264,14 @@
               entities: entityUpdates,
             }),
           });
-          showAlert("Assessment committed and flagged indicators processed.", "success");
+          const pub = res.publication || {};
+          if (pub.count > 0 && !pub.published) {
+            showAlert(`Assessment committed, but ScamIntel_CL publish failed (logged): ${pub.error || "unknown error"}`, "warning");
+          } else if (pub.count > 0) {
+            showAlert(`Assessment committed and ${pub.count} indicator(s) accepted by ScamIntel_CL (may take a few minutes to become searchable).`, "success");
+          } else {
+            showAlert("Assessment committed.", "success");
+          }
           renderDetail(res.detail);
           await loadReports();
         } catch (err) {
@@ -310,19 +279,6 @@
         }
       });
     }
-
-    async function retryOutbox(outboxId) {
-      try {
-        await apiFetch(`/api/staff/outbox/${encodeURIComponent(outboxId)}/retry`, { method: "POST" });
-        showAlert("Outbox retry completed.", "info");
-        if (selectedReportId) {
-          await selectReport(selectedReportId);
-        }
-      } catch (err) {
-        showAlert(err.message);
-      }
-    }
-
     document.getElementById("refresh-btn").addEventListener("click", loadReports);
     document.getElementById("status-filter").addEventListener("change", loadReports);
 

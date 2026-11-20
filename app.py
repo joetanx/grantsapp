@@ -221,7 +221,7 @@ async def db_insert_entities(report_id: uuid.UUID, entities: list[dict[str, str]
         for ent in entities:
             cur = await conn.execute(
                 """
-                INSERT INTO report_entities (id, report_id, type, value, matches, confidence, flag_for_scamintel)
+                INSERT INTO entities (id, report_id, type, value, matches, confidence, flag_for_scamintel)
                 VALUES (%s, %s, %s, %s, 'none', 'medium', FALSE)
                 RETURNING *
                 """,
@@ -244,7 +244,7 @@ async def db_update_entity_match(
     async with await get_db_conn() as conn:
         await conn.execute(
             """
-            UPDATE report_entities
+            UPDATE entities
             SET matches = %s,
                 evidence_ref = %s,
                 confidence = %s,
@@ -324,9 +324,7 @@ async def db_list_reports(
             SELECT r.*,
                    u.display_name AS reporter_name,
                    u.email AS reporter_email,
-                   (SELECT COUNT(*) FROM report_entities e WHERE e.report_id = r.id) AS entity_count,
-                   (SELECT COUNT(*) FROM publication_outbox o WHERE o.report_id = r.id AND o.status = 'published') AS published_count,
-                   (SELECT COUNT(*) FROM publication_outbox o WHERE o.report_id = r.id AND o.status = 'failed') AS failed_pub_count
+                   (SELECT COUNT(*) FROM entities e WHERE e.report_id = r.id) AS entity_count
             FROM reports r
             LEFT JOIN users u ON u.id = r.reporter_user_id
             {where_sql}
@@ -354,7 +352,7 @@ async def db_get_report_detail(report_id: uuid.UUID) -> Optional[dict[str, Any]]
             return None
 
         cur = await conn.execute(
-            "SELECT * FROM report_entities WHERE report_id = %s ORDER BY created_at ASC",
+            "SELECT * FROM entities WHERE report_id = %s ORDER BY created_at ASC",
             (report_id,),
         )
         entities = await cur.fetchall()
@@ -371,23 +369,10 @@ async def db_get_report_detail(report_id: uuid.UUID) -> Optional[dict[str, Any]]
         )
         assessments = await cur.fetchall()
 
-        cur = await conn.execute(
-            """
-            SELECT o.*, ir.latest_version
-            FROM publication_outbox o
-            LEFT JOIN indicator_registry ir ON ir.id = o.indicator_id
-            WHERE o.report_id = %s
-            ORDER BY o.created_at DESC
-            """,
-            (report_id,),
-        )
-        outbox = await cur.fetchall()
-
         return {
             "report": report,
             "entities": entities,
             "assessments": assessments,
-            "outbox": outbox,
         }
 
 
@@ -397,21 +382,20 @@ async def db_commit_staff_review(
     verdict: str,
     rationale: str,
     entity_updates: list[dict[str, Any]],
-) -> list[uuid.UUID]:
-    """Commit staff review, update entities, append assessment, and enqueue ScamIntel_CL outbox."""
-    created_outbox_ids: list[uuid.UUID] = []
+) -> list[dict[str, Any]]:
+    """Commit staff review, update entities, append assessment, and build ScamIntel_CL records."""
+    records_to_publish: list[dict[str, Any]] = []
     async with await get_db_conn() as conn:
         cur = await conn.execute("SELECT received_at FROM reports WHERE id = %s", (report_id,))
         report_row = await cur.fetchone()
         if not report_row:
             raise LookupError("Report not found")
-        observed_at = report_row["received_at"]
 
         for upd in entity_updates:
             ent_id = uuid.UUID(str(upd["id"]))
             await conn.execute(
                 """
-                UPDATE report_entities
+                UPDATE entities
                 SET matches = COALESCE(%s, matches),
                     evidence_ref = COALESCE(%s, evidence_ref),
                     confidence = COALESCE(%s, confidence),
@@ -452,11 +436,11 @@ async def db_commit_staff_review(
             (verdict, report_id),
         )
 
-        # Enqueue flagged entities into indicator_registry + publication_outbox
+        # Build ScamIntel_CL records for flagged entities using MIN/MAX report received_at
         if verdict == "suspected_scam":
             cur = await conn.execute(
                 """
-                SELECT * FROM report_entities
+                SELECT * FROM entities
                 WHERE report_id = %s
                   AND (flag_for_scamintel = TRUE OR matches IN ('public_web', 'scamintel'))
                 """,
@@ -465,45 +449,34 @@ async def db_commit_staff_review(
             flagged = await cur.fetchall()
             now_utc = datetime.now(UTC)
             for ent in flagged:
-                cur_ind = await conn.execute(
+                cur_obs = await conn.execute(
                     """
-                    INSERT INTO indicator_registry (
-                        id, entity_type, entity_value, first_observed_at, last_observed_at, latest_version, created_at, updated_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, 1, now(), now())
-                    ON CONFLICT (entity_type, entity_value) DO UPDATE
-                    SET last_observed_at = GREATEST(indicator_registry.last_observed_at, EXCLUDED.last_observed_at),
-                        latest_version = indicator_registry.latest_version + 1,
-                        updated_at = now()
-                    RETURNING *
+                    SELECT MIN(r.received_at) AS first_observed_at,
+                           MAX(r.received_at) AS last_observed_at
+                    FROM entities e
+                    JOIN reports r ON r.id = e.report_id
+                    WHERE e.type = %s AND e.value = %s
                     """,
-                    (uuid.uuid4(), ent["type"], ent["value"], observed_at, observed_at),
+                    (ent["type"], ent["value"]),
                 )
-                ind = await cur_ind.fetchone()
-                payload = {
-                    "TimeGenerated": now_utc.isoformat(),
-                    "ReportEntityId": str(ent["id"]),
-                    "EntityType": ent["type"],
-                    "EntityValue": ent["value"],
-                    "EvidenceRef": ent.get("evidence_ref") or "",
-                    "Confidence": ent.get("confidence") or "medium",
-                    "FirstObservedAt": ind["first_observed_at"].isoformat(),
-                    "LastObservedAt": ind["last_observed_at"].isoformat(),
-                }
-                outbox_id = uuid.uuid4()
-                await conn.execute(
-                    """
-                    INSERT INTO publication_outbox (
-                        id, report_id, report_entity_id, indicator_id, status, attempts, payload, created_at, updated_at
-                    )
-                    VALUES (%s, %s, %s, %s, 'pending', 0, %s::jsonb, now(), now())
-                    """,
-                    (outbox_id, report_id, ent["id"], ind["id"], json.dumps(payload)),
+                obs_bounds = await cur_obs.fetchone()
+                first_obs = (obs_bounds and obs_bounds["first_observed_at"]) or report_row["received_at"]
+                last_obs = (obs_bounds and obs_bounds["last_observed_at"]) or report_row["received_at"]
+                records_to_publish.append(
+                    {
+                        "TimeGenerated": now_utc.isoformat(),
+                        "ReportEntityId": str(ent["id"]),
+                        "EntityType": ent["type"],
+                        "EntityValue": ent["value"],
+                        "EvidenceRef": ent.get("evidence_ref") or "",
+                        "Confidence": ent.get("confidence") or "medium",
+                        "FirstObservedAt": first_obs.isoformat(),
+                        "LastObservedAt": last_obs.isoformat(),
+                    }
                 )
-                created_outbox_ids.append(outbox_id)
 
         await conn.commit()
-    return created_outbox_ids
+    return records_to_publish
 
 
 # ---------------------------------------------------------------------------
@@ -589,52 +562,21 @@ async def ingest_scamintel_records(records: list[dict[str, Any]]) -> None:
     await asyncio.to_thread(_upload)
 
 
-async def publish_outbox_item(outbox_id: uuid.UUID) -> dict[str, Any]:
-    """Attempt to publish a single outbox row to Sentinel ScamIntel_CL."""
-    async with await get_db_conn() as conn:
-        cur = await conn.execute("SELECT * FROM publication_outbox WHERE id = %s", (outbox_id,))
-        item = await cur.fetchone()
-        if not item:
-            raise LookupError("Outbox item not found")
-
-    payload = item["payload"]
+async def publish_scamintel_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Inline publish records to Sentinel ScamIntel_CL; log and move on if ingestion fails."""
+    if not records:
+        return {"published": True, "count": 0}
     try:
-        await ingest_scamintel_records([payload])
-        async with await get_db_conn() as conn:
-            cur = await conn.execute(
-                """
-                UPDATE publication_outbox
-                SET status = 'published',
-                    attempts = attempts + 1,
-                    last_error = NULL,
-                    published_at = now(),
-                    updated_at = now()
-                WHERE id = %s
-                RETURNING *
-                """,
-                (outbox_id,),
-            )
-            updated = await cur.fetchone()
-            await conn.commit()
-            return updated
+        await ingest_scamintel_records(records)
+        return {"published": True, "count": len(records)}
     except Exception as exc:
-        logger.warning("Failed to publish outbox %s: %s", outbox_id, exc)
-        async with await get_db_conn() as conn:
-            cur = await conn.execute(
-                """
-                UPDATE publication_outbox
-                SET status = 'failed',
-                    attempts = attempts + 1,
-                    last_error = %s,
-                    updated_at = now()
-                WHERE id = %s
-                RETURNING *
-                """,
-                (str(exc), outbox_id),
-            )
-            updated = await cur.fetchone()
-            await conn.commit()
-            return updated
+        logger.error(
+            "Failed to publish %d ScamIntel_CL record(s): %s | records=%s",
+            len(records),
+            exc,
+            json.dumps(records, default=str),
+        )
+        return {"published": False, "count": len(records), "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -1275,7 +1217,7 @@ async def handle_staff_commit(request: Request) -> Response:
         return web.json_response({"error": "rationale is required"}, status=400)
 
     try:
-        outbox_ids = await db_commit_staff_review(
+        records = await db_commit_staff_review(
             report_id=report_id,
             staff_user_id=user["id"],
             verdict=verdict,
@@ -1285,28 +1227,13 @@ async def handle_staff_commit(request: Request) -> Response:
     except LookupError:
         return web.json_response({"error": "Report not found"}, status=404)
 
-    published_results = []
-    for oid in outbox_ids:
-        published_results.append(await publish_outbox_item(oid))
+    publication = await publish_scamintel_records(records)
 
     detail = await db_get_report_detail(report_id)
     return web.json_response(
-        {"detail": detail, "published": published_results},
+        {"detail": detail, "publication": publication},
         dumps=lambda x: json.dumps(x, default=str),
     )
-
-
-async def handle_retry_outbox(request: Request) -> Response:
-    await resolve_current_user(request)
-    try:
-        outbox_id = uuid.UUID(request.match_info["id"])
-    except ValueError:
-        return web.json_response({"error": "Invalid outbox ID"}, status=400)
-    try:
-        updated = await publish_outbox_item(outbox_id)
-    except LookupError:
-        return web.json_response({"error": "Outbox item not found"}, status=404)
-    return web.json_response({"outbox": updated}, dumps=lambda x: json.dumps(x, default=str))
 
 
 # ---------------------------------------------------------------------------
@@ -1443,7 +1370,6 @@ def create_app() -> Application:
     app.router.add_get("/api/staff/reports", handle_staff_list_reports)
     app.router.add_get("/api/staff/reports/{id}", handle_report_detail)
     app.router.add_post("/api/staff/reports/{id}/commit", handle_staff_commit)
-    app.router.add_post("/api/staff/outbox/{id}/retry", handle_retry_outbox)
 
     # Channel Webhooks
     app.router.add_post("/api/telegram/webhook", handle_telegram_webhook)
